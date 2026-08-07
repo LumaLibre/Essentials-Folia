@@ -1,0 +1,278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jsinco <jonah@jsinco.dev>
+Date: Thu, 6 Aug 2026 22:56:41 -0400
+Subject: [PATCH] fix `/back` on canvas
+
+
+diff --git a/Essentials/build.gradle b/Essentials/build.gradle
+index c6aeb2136591c8c643669629a8820bacfb72dcda..4bf26b48161e94a956b6090fa5cf2143d79cc44c 100644
+--- a/Essentials/build.gradle
++++ b/Essentials/build.gradle
+@@ -25,6 +25,9 @@ dependencies {
+     api(project(path: ':providers:PaperProvider', configuration: 'shadow')){
+         exclude(module: 'paper-api')
+     }
++    api(project(':providers:CanvasProvider')) {
++        exclude(module: 'canvas-api')
++    }
+     api(project(':providers:NMSReflectionProvider')) {
+         exclude(module: 'bukkit')
+     }
+@@ -73,6 +76,7 @@ shadowJar {
+         include (dependency('net.kyori:adventure-text-minimessage'))
+         include (project(':providers:BaseProviders'))
+         include (project(path: ':providers:PaperProvider', configuration: 'shadow'))
++        include (project(':providers:CanvasProvider'))
+         include (project(':providers:NMSReflectionProvider'))
+         include (project(':providers:1_8Provider'))
+         include (project(':providers:1_12Provider'))
+diff --git a/Essentials/src/main/java/com/earth2me/essentials/EssentialsPlayerListener.java b/Essentials/src/main/java/com/earth2me/essentials/EssentialsPlayerListener.java
+index 31b4c8ffb95e58e1f799ebabdaf5af884bb303a4..76d566476bea663ab0b5548bd2807ae865cc84fb 100644
+--- a/Essentials/src/main/java/com/earth2me/essentials/EssentialsPlayerListener.java
++++ b/Essentials/src/main/java/com/earth2me/essentials/EssentialsPlayerListener.java
+@@ -25,8 +25,10 @@ import net.ess3.provider.CommandSendListenerProvider;
+ import net.ess3.provider.FormattedCommandAliasProvider;
+ import net.ess3.provider.InventoryViewProvider;
+ import net.ess3.provider.KnownCommandsProvider;
++import net.ess3.provider.RegionizedEventListenerProvider;
+ import net.ess3.provider.TickCountProvider;
+ import net.ess3.provider.providers.BukkitCommandSendListenerProvider;
++import net.ess3.provider.providers.CanvasRegionizedEventListenerProvider;
+ import net.ess3.provider.providers.PaperCommandSendListenerProvider;
+ import net.essentialsx.PaperAdventureSmuggler;
+ import net.essentialsx.api.v2.events.AsyncUserDataLoadEvent;
+@@ -93,6 +95,10 @@ import java.util.regex.Pattern;
+ import static com.earth2me.essentials.I18n.tlLiteral;
+ 
+ public class EssentialsPlayerListener implements Listener {
++    // Folia rewrote teleporting and respawning, and no longer fires the Bukkit events for them. Canvas adds its own
++    // region threading events to replace them, so when they are available we listen to those instead.
++    private static final boolean CANVAS_REGIONIZED_EVENTS = isCanvasRegionizedEvent();
++
+     private final transient IEssentials ess;
+     private final ConcurrentHashMap<UUID, io.papermc.paper.threadedregions.scheduler.ScheduledTask> pendingMotdTasks = new ConcurrentHashMap<>();
+ 
+@@ -145,6 +151,16 @@ public class EssentialsPlayerListener implements Listener {
+         }
+     }
+ 
++    private static boolean isCanvasRegionizedEvent() {
++        try {
++            Class.forName("io.canvasmc.canvas.event.EntityPostTeleportAsyncEvent");
++            Class.forName("io.canvasmc.canvas.event.PlayerPostRespawnAsyncEvent");
++            return true;
++        } catch (final ClassNotFoundException ignored) {
++            return false;
++        }
++    }
++
+     public void registerEvents() {
+         ess.getServer().getPluginManager().registerEvents(this, ess);
+ 
+@@ -168,6 +184,10 @@ public class EssentialsPlayerListener implements Listener {
+             ess.getServer().getPluginManager().registerEvents(new BukkitCommandSendListenerProvider(new CommandSendFilter()), ess);
+         }
+ 
++        if (CANVAS_REGIONIZED_EVENTS) {
++            ess.getServer().getPluginManager().registerEvents(new CanvasRegionizedEventListenerProvider(new RegionizedEventHandler()), ess);
++        }
++
+         if (VersionUtil.isPaper() && VersionUtil.getServerBukkitVersion().isHigherThanOrEqualTo(VersionUtil.v1_21_8_R01)) {
+             ess.getServer().getPluginManager().registerEvents(new LoginListener1_21(), ess);
+             ess.getServer().getPluginManager().registerEvents(new JoinListener1_21(), ess);
+@@ -179,7 +199,15 @@ public class EssentialsPlayerListener implements Listener {
+ 
+     @EventHandler(priority = EventPriority.NORMAL)
+     public void onPlayerRespawn(final PlayerRespawnEvent event) {
+-        final User user = ess.getUser(event.getPlayer());
++        if (CANVAS_REGIONIZED_EVENTS) {
++            // Handled from PlayerPostRespawnAsyncEvent instead, see RegionizedEventHandler.
++            return;
++        }
++
++        handleRespawn(ess.getUser(event.getPlayer()));
++    }
++
++    private void handleRespawn(final User user) {
+         updateCompass(user);
+         user.setDisplayNick();
+ 
+@@ -737,17 +765,16 @@ public class EssentialsPlayerListener implements Listener {
+ 
+     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+     public void onPlayerTeleport(final PlayerTeleportEvent event) {
++        if (CANVAS_REGIONIZED_EVENTS) {
++            // Handled from EntityPostTeleportAsyncEvent instead, see RegionizedEventHandler.
++            return;
++        }
++
+         final Player player = event.getPlayer();
+-        if (player.hasMetadata("NPC") || !(event.getCause() == TeleportCause.PLUGIN || event.getCause() == TeleportCause.COMMAND)) {
++        if (!handleTeleport(player, event.getFrom(), event.getCause())) {
+             return;
+         }
+         final User user = ess.getUser(player);
+-        if (ess.getSettings().registerBackInListener() && user.isAuthorized("essentials.back.onteleport")) {
+-            user.setLastLocation();
+-        }
+-        if (ess.getSettings().isTeleportInvulnerability()) {
+-            user.enableInvulnerabilityAfterTeleport();
+-        }
+ 
+         // Mitigation for https://github.com/EssentialsX/Essentials/issues/4325
+         final TickCountProvider tickCountProvider = ess.provider(TickCountProvider.class);
+@@ -765,6 +792,36 @@ public class EssentialsPlayerListener implements Listener {
+         }
+     }
+ 
++    // Returns whether this is a teleport Essentials cares about.
++    private boolean handleTeleport(final Player player, final Location from, final TeleportCause cause) {
++        if (player.hasMetadata("NPC") || !(cause == TeleportCause.PLUGIN || cause == TeleportCause.COMMAND)) {
++            return false;
++        }
++
++        final User user = ess.getUser(player);
++        if (ess.getSettings().registerBackInListener() && user.isAuthorized("essentials.back.onteleport")) {
++            user.setLastLocation(from);
++        }
++        if (ess.getSettings().isTeleportInvulnerability()) {
++            user.enableInvulnerabilityAfterTeleport();
++        }
++        return true;
++    }
++
++    private final class RegionizedEventHandler implements RegionizedEventListenerProvider.Handler {
++        @Override
++        public void onPostTeleport(final Player player, final Location from, final Location to, final TeleportCause cause) {
++            // The flight mitigation of onPlayerTeleport isn't applied here: it records the flight state of the player
++            // before the world change, which has already happened by the time this event is fired.
++            handleTeleport(player, from, cause);
++        }
++
++        @Override
++        public void onPostRespawn(final Player player, final Location respawnLocation) {
++            handleRespawn(ess.getUser(player));
++        }
++    }
++
+     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+     public void onPlayerEggThrow(final PlayerEggThrowEvent event) {
+         final User user = ess.getUser(event.getPlayer());
+diff --git a/providers/BaseProviders/src/main/java/net/ess3/provider/RegionizedEventListenerProvider.java b/providers/BaseProviders/src/main/java/net/ess3/provider/RegionizedEventListenerProvider.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..33aeeca6cd46f556281abdde98e8a886fdc4f480
+--- /dev/null
++++ b/providers/BaseProviders/src/main/java/net/ess3/provider/RegionizedEventListenerProvider.java
+@@ -0,0 +1,24 @@
++package net.ess3.provider;
++
++import org.bukkit.Location;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Listener;
++import org.bukkit.event.player.PlayerTeleportEvent;
++
++public abstract class RegionizedEventListenerProvider implements Provider, Listener {
++    private final Handler handler;
++
++    protected RegionizedEventListenerProvider(final Handler handler) {
++        this.handler = handler;
++    }
++
++    protected final Handler handler() {
++        return handler;
++    }
++
++    public interface Handler {
++        void onPostTeleport(Player player, Location from, Location to, PlayerTeleportEvent.TeleportCause cause);
++
++        void onPostRespawn(Player player, Location respawnLocation);
++    }
++}
+diff --git a/providers/CanvasProvider/build.gradle b/providers/CanvasProvider/build.gradle
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac86cde8c69933a7c2b8bd2f66e1d1c0b936ad89
+--- /dev/null
++++ b/providers/CanvasProvider/build.gradle
+@@ -0,0 +1,27 @@
++plugins {
++    id("essentials.base-conventions")
++}
++
++java {
++    disableAutoTargetJvm()
++}
++
++dependencies {
++    implementation(project(':providers:BaseProviders')) {
++        exclude(module: 'spigot-api')
++    }
++    compileOnly 'io.canvasmc.canvas:canvas-api:26.2.build.903-stable'
++}
++
++essentials {
++    injectBukkitApi.set(false)
++    injectBstats.set(false)
++}
++
++configurations.testImplementation {
++    exclude(group: 'org.mockbukkit.mockbukkit')
++}
++
++test {
++    enabled = false
++}
+diff --git a/providers/CanvasProvider/src/main/java/net/ess3/provider/providers/CanvasRegionizedEventListenerProvider.java b/providers/CanvasProvider/src/main/java/net/ess3/provider/providers/CanvasRegionizedEventListenerProvider.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fade9c19e71d7c45b2d1e7cefe2266ed5610fba
+--- /dev/null
++++ b/providers/CanvasProvider/src/main/java/net/ess3/provider/providers/CanvasRegionizedEventListenerProvider.java
+@@ -0,0 +1,28 @@
++package net.ess3.provider.providers;
++
++import io.canvasmc.canvas.event.EntityPostTeleportAsyncEvent;
++import io.canvasmc.canvas.event.PlayerPostRespawnAsyncEvent;
++import net.ess3.provider.RegionizedEventListenerProvider;
++import org.bukkit.entity.Player;
++import org.bukkit.event.EventHandler;
++import org.bukkit.event.EventPriority;
++
++public class CanvasRegionizedEventListenerProvider extends RegionizedEventListenerProvider {
++    public CanvasRegionizedEventListenerProvider(final Handler handler) {
++        super(handler);
++    }
++
++    @EventHandler(priority = EventPriority.HIGH)
++    public void onPostTeleport(final EntityPostTeleportAsyncEvent event) {
++        if (!(event.getEntity() instanceof Player)) {
++            return;
++        }
++
++        handler().onPostTeleport((Player) event.getEntity(), event.getFrom(), event.getTo(), event.getCause());
++    }
++
++    @EventHandler(priority = EventPriority.NORMAL)
++    public void onPostRespawn(final PlayerPostRespawnAsyncEvent event) {
++        handler().onPostRespawn(event.getPlayer(), event.getRespawnLocation());
++    }
++}
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index fc0cf3f4435dc39c22574f66fdd1f2368fb44755..cc378774c9db6d35cc17a0f5aee43a5080c291eb 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -21,6 +21,9 @@ dependencyResolutionManagement {
+         maven("https://libraries.minecraft.net/") {
+             content { includeGroup("com.mojang") }
+         }
++        maven("https://maven.canvasmc.io/releases") {
++            content { includeGroup("io.canvasmc.canvas") }
++        }
+     }
+     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+ }
+@@ -55,5 +58,6 @@ sequenceOf(
+ include(":providers:BaseProviders")
+ include(":providers:NMSReflectionProvider")
+ include(":providers:PaperProvider")
++include(":providers:CanvasProvider")
+ include(":providers:1_8Provider")
+ include(":providers:1_12Provider")
